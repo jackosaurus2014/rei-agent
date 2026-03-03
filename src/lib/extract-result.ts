@@ -120,20 +120,24 @@ export async function extractSubAgentResult(
 
   const { findings, riskFlags, confidence } = toolUseBlock.input as {
     findings: string;
-    riskFlags: string[];
+    riskFlags: string[] | null | undefined;
     confidence: Confidence;
   };
 
+  // Guard against the model returning null/undefined for array fields despite
+  // the schema marking them as required — observed in production with Haiku.
+  const safeRiskFlags = Array.isArray(riskFlags) ? riskFlags : [];
+
   logger.debug(`Extraction complete for ${category}`, {
-    riskFlagCount: riskFlags.length,
+    riskFlagCount: safeRiskFlags.length,
     confidence,
   });
 
   return {
     category,
-    findings,
-    riskFlags,
-    confidence,
+    findings: findings ?? 'No findings available.',
+    riskFlags: safeRiskFlags,
+    confidence: confidence ?? 'low',
     searchesPerformed: toolCallCount,
   };
 }
