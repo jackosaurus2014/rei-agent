@@ -152,7 +152,13 @@ async function extractListings(
     return { listings: [], marketContext: 'Extraction failed — no structured data returned.', searchesPerformed: 0 };
   }
 
-  return toolBlock.input as RawListingResult;
+  const raw = toolBlock.input as RawListingResult;
+  // Guard against model returning null for array fields despite schema marking them required
+  return {
+    listings: Array.isArray(raw.listings) ? raw.listings : [],
+    marketContext: raw.marketContext ?? 'No market context provided.',
+    searchesPerformed: raw.searchesPerformed ?? 0,
+  };
 }
 
 // ── TypeScript screening ──────────────────────────────────────────────────────
