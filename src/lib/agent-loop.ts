@@ -17,6 +17,7 @@ export interface AgentLoopOptions {
   initialMessage: string;
   tools: Anthropic.Tool[];
   maxIterations?: number;
+  maxTokensPerCall?: number;
   agentLabel?: string;
 }
 
@@ -35,6 +36,7 @@ export async function runAgentLoop(
     initialMessage,
     tools,
     maxIterations = Number(process.env.AGENT_MAX_ITERATIONS ?? 15),
+    maxTokensPerCall = 4096,
     agentLabel = 'agent',
   } = options;
 
@@ -51,7 +53,7 @@ export async function runAgentLoop(
       () =>
         client.messages.create({
           model,
-          max_tokens: 4096,
+          max_tokens: maxTokensPerCall,
           system: systemPrompt,
           tools,
           messages,

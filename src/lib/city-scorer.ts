@@ -59,14 +59,16 @@ function invertedMinMaxNormalize(values: number[]): number[] {
 // ── Main scoring function ─────────────────────────────────────────────────────
 
 export function scoreCities(rawData: CityRawData[]): CityScore[] {
-  // Discard cities with too many null factors — they can't be scored reliably
+  // Discard cities with too many null factors — they can't be scored reliably.
+  // Threshold is 5 (must have at least 3 real data points out of 8); nulls are
+  // filled with the column median before scoring so partial data is usable.
   const viable = rawData.filter(c => {
     const nullCount = [
       c.populationGrowthPct, c.jobGrowthPct, c.wageGrowthPct,
       c.rentGrowthPct, c.medianGRM, c.crimeIndexVsNational,
       c.avgSchoolRating, c.landlordFriendlyScore,
     ].filter(v => v === null).length;
-    return nullCount <= 3;
+    return nullCount <= 5;
   });
 
   if (viable.length === 0) return [];

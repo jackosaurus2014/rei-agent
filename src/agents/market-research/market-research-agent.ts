@@ -96,13 +96,12 @@ For each city, collect data on 8 scoring factors:
 7. Average school rating (1–10 scale)
 8. Landlord-friendliness score (1–10)
 
-**The 30 candidate cities:**
-Sun Belt: Phoenix AZ, Tampa FL, Jacksonville FL, Orlando FL, Charlotte NC, Nashville TN, Atlanta GA, Dallas TX, Houston TX, San Antonio TX
-Midwest: Indianapolis IN, Columbus OH, Cincinnati OH, Kansas City MO, Memphis TN, St. Louis MO, Cleveland OH, Detroit MI, Milwaukee WI
-Southeast: Birmingham AL, Huntsville AL, Savannah GA, Augusta GA
-Southwest: Las Vegas NV, Tucson AZ, Albuquerque NM
-Northwest: Boise ID, Spokane WA
-Other: Pittsburgh PA, Baltimore MD
+**The 15 candidate cities** (top cash-flow markets by investor consensus):
+Sun Belt: Tampa FL, Charlotte NC, Nashville TN, Atlanta GA, Dallas TX
+Midwest: Indianapolis IN, Columbus OH, Kansas City MO, Memphis TN, Cleveland OH
+Southeast: Birmingham AL, Huntsville AL
+Southwest: Las Vegas NV
+Other: Pittsburgh PA, Jacksonville FL
 
 **Research strategy — start broad, then targeted:**
 1. "best cities real estate investment 2024 2025 cash flow GRM price to rent ratio"
@@ -112,7 +111,9 @@ Other: Pittsburgh PA, Baltimore MD
 5. "best states landlords eviction laws 2024 landlord friendly"
 6. Then targeted searches for individual cities where data is missing
 
-After researching all cities, call submit_city_rankings with all data. Use null for factors you could not find — do not guess.`;
+After researching all cities, call submit_city_rankings with all data. Use null for factors you could not find — do not guess.
+
+**Important**: Use max_results: 3 for every search to keep context small and avoid rate limits.`;
 }
 
 // ── Extraction ────────────────────────────────────────────────────────────────
@@ -134,7 +135,7 @@ async function extractCityData(
         tool_choice: { type: 'tool', name: 'submit_city_rankings' },
         messages: [{ role: 'user', content: `Research notes:\n\n${researchText}` }],
       }),
-    { label: 'extract-city-rankings' }
+    { label: 'extract-city-rankings', attempts: 5 }
   );
 
   const toolBlock = response.content.find(
@@ -279,18 +280,27 @@ export async function runMarketResearch(): Promise<void> {
   // Extended loop (maxIterations: 50) gives the agent room for 40–60 searches
   // across 30 cities. Agent uses bulk searches first, then targeted fill-ins.
 
+  // maxIterations: 15 and maxTokensPerCall: 2048 keep individual API calls
+  // under ~40K input tokens, well within the Tier 1 50K/min limit.
   const { text, toolCallCount } = await runAgentLoop(client, {
     model: MODELS.SUB_AGENT,
     systemPrompt: MARKET_RESEARCH_SYSTEM_PROMPT,
     initialMessage: buildInitialMessage(),
     tools: [WEB_SEARCH_TOOL],
     agentLabel: 'market-research',
-    maxIterations: 50,
+    maxIterations: 15,
+    maxTokensPerCall: 2048,
   });
 
   logger.info('Market research loop complete', { toolCallCount });
 
   // ── Phase 2: Structured extraction ────────────────────────────────────────
+  // Wait 90s before extraction to let the Tier 1 token-per-minute window clear.
+  // The research loop saturates the 50K tpm limit; extraction fired immediately
+  // after will 429. This pause costs 90s but avoids burning all retries.
+
+  logger.info('Cooling down 90s before extraction (Tier 1 rate limit)...');
+  await new Promise(resolve => setTimeout(resolve, 90_000));
 
   logger.info('Extracting city data from research text...');
   const rawData = await extractCityData(client, text);

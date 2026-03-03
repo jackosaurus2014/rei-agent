@@ -12,7 +12,9 @@ export async function withRetry<T>(
   const { attempts = 3, label = 'operation' } = options;
   // Rate limit errors need a full minute to clear; other errors use short backoff
   const standardDelays = [2000, 4000, 8000];
-  const rateLimitDelays = [30000, 60000, 90000];
+  // 65s gaps — each wait exceeds the 60s token-per-minute window so the
+  // next attempt always starts with a fully cleared rate limit budget.
+  const rateLimitDelays = [65000, 65000, 65000, 65000];
 
   for (let i = 0; i < attempts; i++) {
     try {
