@@ -68,7 +68,7 @@ export async function runDealAnalyzer(input: DealInput): Promise<void> {
     return failedSubAgentResult('public_records', err);
   });
 
-  const underwriting = await runUnderwritingAgent(address, purchasePrice).catch((err) => {
+  const underwriting = await runUnderwritingAgent(address, purchasePrice, propertyType).catch((err) => {
     logger.error('Underwriting agent failed', { error: err.message });
     return failedSubAgentResult('underwriting', err);
   });

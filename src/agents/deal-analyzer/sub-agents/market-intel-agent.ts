@@ -50,6 +50,7 @@ export async function runMarketIntelAgent(
     initialMessage: buildInitialMessage(address, purchasePrice),
     tools: TOOLS,
     agentLabel: 'market-intel',
+    maxTokensPerCall: 8192,  // prevent max_tokens truncation mid-research
   });
 
   logger.info('Market Intel research complete', { address, toolCallCount });

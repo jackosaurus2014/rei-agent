@@ -24,15 +24,23 @@ const RENT_ESTIMATE_TOOL: Anthropic.Tool = {
     properties: {
       monthlyRentEstimate: {
         type: 'number',
-        description: 'Best single estimate of monthly rent in dollars (e.g. 1850).',
+        description:
+          'Best single estimate of monthly rent per unit in dollars (e.g. 1850). ' +
+          'For multifamily, this is per-unit rent — NOT total building rent.',
       },
       rentRangeLow: {
         type: 'number',
-        description: 'Conservative (low end) monthly rent estimate in dollars.',
+        description: 'Conservative (low end) monthly rent per unit in dollars.',
       },
       rentRangeHigh: {
         type: 'number',
-        description: 'Optimistic (high end) monthly rent estimate in dollars.',
+        description: 'Optimistic (high end) monthly rent per unit in dollars.',
+      },
+      unitCount: {
+        type: 'number',
+        description:
+          'Number of rentable units in the property. Use 1 for SFR/condo. ' +
+          'For multifamily, use the actual unit count (2 for duplex, 3 for triplex, etc.).',
       },
       confidence: {
         type: 'string',
@@ -51,6 +59,7 @@ const RENT_ESTIMATE_TOOL: Anthropic.Tool = {
       'monthlyRentEstimate',
       'rentRangeLow',
       'rentRangeHigh',
+      'unitCount',
       'confidence',
       'marketContext',
     ],
@@ -61,6 +70,7 @@ interface RentEstimate {
   monthlyRentEstimate: number;
   rentRangeLow: number;
   rentRangeHigh: number;
+  unitCount: number;
   confidence: 'high' | 'medium' | 'low';
   marketContext: string;
 }
@@ -102,6 +112,7 @@ async function extractRentEstimate(
       monthlyRentEstimate: fallback,
       rentRangeLow: Math.round(fallback * 0.9),
       rentRangeHigh: Math.round(fallback * 1.1),
+      unitCount: 1,
       confidence: 'low',
       marketContext: 'Rental data unavailable — estimate based on 0.7% of purchase price. Manual verification required.',
     };
@@ -112,19 +123,28 @@ async function extractRentEstimate(
 
 // ── Initial message ───────────────────────────────────────────────────────────
 
-function buildInitialMessage(address: string, purchasePrice: number): string {
+function buildInitialMessage(address: string, purchasePrice: number, propertyType: string): string {
+  const isMultifamily = propertyType === 'multifamily';
+
+  const multifamilyNote = isMultifamily
+    ? `\n**Property Type**: Multifamily (duplex/triplex/small apartment building)\n` +
+      `This is a multi-unit building. Find the per-unit monthly rent for comparable units in this area.\n` +
+      `Also confirm how many rentable units the property has (check listing details, county records, or MLS).\n` +
+      `Report per-unit rent — the system will multiply by unit count to compute total building income.\n`
+    : `**Property Type**: ${propertyType.toUpperCase()} (single-family or condo — single unit)\n`;
+
   return `Find the current market rent for this property:
 
 **Property Address**: ${address}
 **Purchase Price**: $${purchasePrice.toLocaleString()}
-
+${multifamilyNote}
 I need to know: what will this property rent for on the open market today?
 
 Search for:
 1. Active rental listings in the same zip code and neighborhood for similar properties
 2. Recently rented comparables
 3. Market rent estimates from Zillow, Redfin, or rental data providers
-
+${isMultifamily ? '4. The property\'s unit count (2BR units? 3BR? Mix?) from listing details or county assessor\n' : ''}
 Start with: "${address} for rent" and then "[zip code] [beds] bedroom for rent 2025"`;
 }
 
@@ -132,9 +152,10 @@ Start with: "${address} for rent" and then "[zip code] [beds] bedroom for rent 2
 
 export async function runUnderwritingAgent(
   address: string,
-  purchasePrice: number
+  purchasePrice: number,
+  propertyType: string = 'sfr'
 ): Promise<SubAgentResult> {
-  logger.info('Underwriting agent started', { address, purchasePrice });
+  logger.info('Underwriting agent started', { address, purchasePrice, propertyType });
 
   const client = getAnthropicClient();
 
@@ -143,7 +164,7 @@ export async function runUnderwritingAgent(
   const { text, toolCallCount } = await runAgentLoop(client, {
     model: MODELS.SUB_AGENT,
     systemPrompt: UNDERWRITING_SYSTEM_PROMPT,
-    initialMessage: buildInitialMessage(address, purchasePrice),
+    initialMessage: buildInitialMessage(address, purchasePrice, propertyType),
     tools: [WEB_SEARCH_TOOL],
     agentLabel: 'underwriting',
   });
@@ -154,9 +175,15 @@ export async function runUnderwritingAgent(
 
   const rentEstimate = await extractRentEstimate(client, address, purchasePrice, text);
 
+  // unitCount from the agent (1 for SFR, 2–4 for small multifamily)
+  const unitCount = Math.max(1, rentEstimate.unitCount ?? 1);
+  const totalMonthlyRent = rentEstimate.monthlyRentEstimate * unitCount;
+
   logger.info('Rent estimate extracted', {
     address,
-    rent: rentEstimate.monthlyRentEstimate,
+    rentPerUnit: rentEstimate.monthlyRentEstimate,
+    unitCount,
+    totalMonthlyRent,
     confidence: rentEstimate.confidence,
   });
 
@@ -168,7 +195,7 @@ export async function runUnderwritingAgent(
 
   const results = computeUnderwriting({
     purchasePrice,
-    monthlyRent: rentEstimate.monthlyRentEstimate,
+    monthlyRent: totalMonthlyRent,
     annualRate,
     expenseRatio,
     vacancyRate: 0.08,
