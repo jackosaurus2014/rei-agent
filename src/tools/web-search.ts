@@ -34,45 +34,31 @@ async function tavilySearch(query: string, maxResults: number): Promise<SearchRe
   return response.results ?? [];
 }
 
-// ── Brave Search ──────────────────────────────────────────────────────────────
+// ── Exa ───────────────────────────────────────────────────────────────────────
 
-interface BraveWebResult {
-  title: string;
-  url: string;
-  description?: string;
-  extra_snippets?: string[];
-}
+let _exaClient: import('exa-js').default | null = null;
 
-interface BraveResponse {
-  web?: { results?: BraveWebResult[] };
-}
-
-async function braveSearch(query: string, maxResults: number): Promise<SearchResult[]> {
-  const key = process.env.BRAVE_SEARCH_API_KEY;
-  if (!key) throw new Error('BRAVE_SEARCH_API_KEY is not set');
-
-  const url = new URL('https://api.search.brave.com/res/v1/web/search');
-  url.searchParams.set('q', query);
-  url.searchParams.set('count', String(Math.min(maxResults, 20)));
-
-  const res = await fetch(url.toString(), {
-    headers: {
-      'Accept': 'application/json',
-      'Accept-Encoding': 'gzip',
-      'X-Subscription-Token': key,
-    },
-  });
-
-  if (!res.ok) {
-    throw new Error(`Brave Search HTTP ${res.status}: ${await res.text()}`);
+async function getExaClient(): Promise<import('exa-js').default> {
+  if (!_exaClient) {
+    const key = process.env.EXA_API_KEY;
+    if (!key) throw new Error('EXA_API_KEY is not set');
+    const Exa = (await import('exa-js')).default;
+    _exaClient = new Exa(key);
   }
+  return _exaClient;
+}
 
-  const data = await res.json() as BraveResponse;
-  return (data.web?.results ?? []).map(r => ({
-    title: r.title,
+async function exaSearch(query: string, maxResults: number): Promise<SearchResult[]> {
+  const client = await getExaClient();
+  const response = await client.searchAndContents(query, {
+    numResults: maxResults,
+    text: { maxCharacters: 1000 },  // compact — enough context without burning credits
+  });
+  return (response.results ?? []).map(r => ({
+    title: r.title ?? '',
     url: r.url,
-    snippet: r.description ?? '',
-    content: [r.description, ...(r.extra_snippets ?? [])].filter(Boolean).join(' '),
+    snippet: r.text?.slice(0, 300) ?? '',
+    content: r.text ?? '',
   }));
 }
 
@@ -83,7 +69,7 @@ function isTavilyQuotaError(err: unknown): boolean {
   return msg.includes('exceeds your plan') || msg.includes('set usage limit');
 }
 
-// ── Public search function (Tavily → Brave fallback) ─────────────────────────
+// ── Public search function (Tavily → Exa fallback) ───────────────────────────
 
 export async function webSearch(
   query: string,
@@ -99,23 +85,23 @@ export async function webSearch(
           return await tavilySearch(query, maxResults);
         } catch (err) {
           if (isTavilyQuotaError(err)) {
-            logger.warn('Tavily quota exceeded — falling back to Brave Search', {
+            logger.warn('Tavily quota exceeded — falling back to Exa', {
               query: query.slice(0, 60),
             });
-            // Fall through to Brave
+            // Fall through to Exa
           } else {
-            throw err; // Non-quota Tavily error — let retry handle it
+            throw err; // Non-quota error — let retry handle it
           }
         }
       }
 
-      // Brave fallback
-      if (process.env.BRAVE_SEARCH_API_KEY) {
-        return await braveSearch(query, maxResults);
+      // Exa fallback
+      if (process.env.EXA_API_KEY) {
+        return await exaSearch(query, maxResults);
       }
 
       throw new Error(
-        'All search providers exhausted. Set BRAVE_SEARCH_API_KEY as a fallback for when Tavily quota is exceeded.'
+        'All search providers exhausted. Set EXA_API_KEY as a fallback for when Tavily quota is exceeded.'
       );
     },
     { label: `web_search(${query.slice(0, 40)})` }
