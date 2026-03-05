@@ -29,7 +29,7 @@ async function main() {
         logger.error('property-scout requires --cities "City TN,City2 IN" or --auto');
         process.exit(1);
       }
-      const cities = citiesArg ? citiesArg.split(',').map(c => c.trim()) : [];
+      const cities = citiesArg ? parseCities(citiesArg) : [];
       const maxPrice = Number(getFlag(args, '--max-price') ?? 400000);
       const minPrice = Number(getFlag(args, '--min-price') ?? 50000);
       const scoutType = getFlag(args, '--type') ?? 'sfr';
@@ -61,6 +61,27 @@ async function main() {
       printUsage();
       process.exit(1);
   }
+}
+
+// Parse city list, handling both "Memphis TN,Indianapolis IN" and "Columbus, OH,Indianapolis, IN"
+function parseCities(citiesArg: string): string[] {
+  const parts = citiesArg.split(',');
+  const cities: string[] = [];
+  let i = 0;
+  while (i < parts.length) {
+    const part = parts[i].trim();
+    // If the next segment is just a 2-letter state abbreviation, it belongs to this city
+    if (i + 1 < parts.length && /^\s*[A-Z]{2}\s*$/.test(parts[i + 1])) {
+      cities.push(`${part}, ${parts[i + 1].trim()}`);
+      i += 2;
+    } else if (part) {
+      cities.push(part);
+      i++;
+    } else {
+      i++;
+    }
+  }
+  return cities;
 }
 
 function getFlag(args: string[], flag: string): string | undefined {

@@ -8,7 +8,8 @@ import { logger } from '../../lib/logger';
 import { writePropertyScout } from '../../lib/output-writer';
 import { computeUnderwriting } from '../../lib/underwriting-calculator';
 import { PROPERTY_SCOUT_SYSTEM_PROMPT } from '../../prompts/property-scout-system';
-import { WEB_SEARCH_TOOL } from '../../tools/web-search';
+import { WEB_SEARCH_TOOL, webSearch } from '../../tools/web-search';
+import { searchRedfinListings, type RedfinListing } from '../../tools/redfin-search';
 import type { PropertyListing } from '../../types';
 
 // ── Options ───────────────────────────────────────────────────────────────────
@@ -71,6 +72,127 @@ const PROPERTY_LISTINGS_TOOL: Anthropic.Tool = {
     required: ['listings', 'marketContext', 'searchesPerformed'],
   },
 };
+
+// ── Rent lookup tool (used with Redfin path) ──────────────────────────────────
+
+const RENT_LOOKUP_TOOL: Anthropic.Tool = {
+  name: 'submit_rent_lookup',
+  description:
+    'Submit estimated monthly market rents by bedroom count for this city, based on your research.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      rent1br: { type: 'number', description: 'Estimated monthly rent for 1-bedroom unit.' },
+      rent2br: { type: 'number', description: 'Estimated monthly rent for 2-bedroom unit.' },
+      rent3br: { type: 'number', description: 'Estimated monthly rent for 3-bedroom unit.' },
+      rent4br: { type: 'number', description: 'Estimated monthly rent for 4-bedroom unit.' },
+      source:  { type: 'string', description: 'Data source (e.g., Zillow, Rentometer, RentCast).' },
+    },
+    required: ['rent1br', 'rent2br', 'rent3br', 'rent4br', 'source'],
+  },
+};
+
+interface RentLookup {
+  rent1br: number;
+  rent2br: number;
+  rent3br: number;
+  rent4br: number;
+}
+
+// Fallback rents used when research fails (conservative national averages for smaller metros)
+const FALLBACK_RENTS: RentLookup = { rent1br: 850, rent2br: 1050, rent3br: 1250, rent4br: 1450 };
+
+function getRentForBeds(beds: number, lookup: RentLookup): number {
+  if (beds <= 1) return lookup.rent1br;
+  if (beds === 2) return lookup.rent2br;
+  if (beds === 3) return lookup.rent3br;
+  return lookup.rent4br; // 4+ bed
+}
+
+async function estimateCityRents(
+  client: Anthropic,
+  city: string
+): Promise<RentLookup> {
+  try {
+    // One search for rent data
+    const results = await webSearch(`${city} average monthly rent 2025 by bedroom 1BR 2BR 3BR`, 3);
+    const searchText = results.map(r => `${r.title}\n${r.snippet}\n${r.content}`).join('\n\n---\n\n');
+
+    const response = await withRetry(
+      () =>
+        client.messages.create({
+          model: MODELS.SUB_AGENT,
+          max_tokens: 1024,
+          system:
+            `You are extracting rental rate data for ${city}. ` +
+            'Call submit_rent_lookup with the best estimate for each bedroom count based on the research. ' +
+            'If a specific value is not found, estimate based on nearby values (e.g., 4BR ≈ 3BR + 15%).',
+          tools: [RENT_LOOKUP_TOOL],
+          tool_choice: { type: 'tool', name: 'submit_rent_lookup' },
+          messages: [{ role: 'user', content: `Rental market research for ${city}:\n\n${searchText}` }],
+        }),
+      { label: `rent-lookup-${city}` }
+    );
+
+    const toolBlock = response.content.find(
+      (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use'
+    );
+
+    if (toolBlock) {
+      const raw = toolBlock.input as RentLookup & { source?: string };
+      logger.info('Rent lookup extracted', { city, rent3br: raw.rent3br, source: raw.source });
+      return {
+        rent1br: raw.rent1br ?? FALLBACK_RENTS.rent1br,
+        rent2br: raw.rent2br ?? FALLBACK_RENTS.rent2br,
+        rent3br: raw.rent3br ?? FALLBACK_RENTS.rent3br,
+        rent4br: raw.rent4br ?? FALLBACK_RENTS.rent4br,
+      };
+    }
+  } catch (err) {
+    logger.warn('Rent estimation failed, using fallback rents', {
+      city,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  return FALLBACK_RENTS;
+}
+
+// ── Convert Redfin listing to RawListingResult format ─────────────────────────
+
+function redfinToRaw(
+  listings: RedfinListing[],
+  rentLookup: RentLookup,
+  city: string
+): RawListingResult {
+  return {
+    listings: listings.map(r => {
+      const rent = getRentForBeds(r.beds, rentLookup);
+      const typeLabel = r.propertyType.includes('Multi') ? 'Multifamily' : 'Single family';
+      const dom = r.daysOnMarket > 0 ? `${r.daysOnMarket} days on market.` : 'Days on market unknown.';
+      return {
+        address: r.address,
+        city: r.city,
+        state: r.state,
+        zipCode: r.zipCode,
+        price: r.price,
+        beds: r.beds,
+        baths: r.baths,
+        sqft: r.sqft,
+        estimatedMonthlyRent: rent,
+        source: 'redfin',
+        url: r.url,
+        notes: `${typeLabel}. ${dom} Rent estimated from ${city} market data.`,
+      };
+    }),
+    marketContext:
+      `Found ${listings.length} active Redfin listings in ${city} ` +
+      `priced between $${listings.length > 0 ? Math.min(...listings.map(l => l.price)).toLocaleString() : '?'} ` +
+      `and $${listings.length > 0 ? Math.max(...listings.map(l => l.price)).toLocaleString() : '?'}. ` +
+      `Rents estimated from local market data (3BR ~$${rentLookup.rent3br.toLocaleString()}/mo).`,
+    searchesPerformed: 2,
+  };
+}
 
 // ── Build initial message per city ────────────────────────────────────────────
 
@@ -434,19 +556,42 @@ export async function runPropertyScout(options: PropertyScoutOptions): Promise<v
   for (const city of cities) {
     logger.info('Scouting city', { city });
 
-    const { text, toolCallCount } = await runAgentLoop(client, {
-      model: MODELS.SUB_AGENT,
-      systemPrompt: PROPERTY_SCOUT_SYSTEM_PROMPT,
-      initialMessage: buildCityMessage(city, maxPrice, minPrice, propertyType),
-      tools: [WEB_SEARCH_TOOL],
-      agentLabel: `scout-${city.replace(/\s+/g, '-').toLowerCase()}`,
-      maxIterations: 20,
+    // ── Primary path: Redfin API ─────────────────────────────────────────────
+    let raw: RawListingResult;
+
+    const redfinListings = await searchRedfinListings(city, minPrice, maxPrice).catch(err => {
+      logger.warn('Redfin search failed, will use web search fallback', {
+        city,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return [] as RedfinListing[];
     });
 
-    logger.info('Scout research complete', { city, toolCallCount });
+    if (redfinListings.length >= 3) {
+      logger.info('Using Redfin listings', { city, count: redfinListings.length });
+      const rentLookup = await estimateCityRents(client, city);
+      raw = redfinToRaw(redfinListings, rentLookup, city);
+    } else {
+      // ── Fallback: web search agent loop ─────────────────────────────────────
+      logger.info('Redfin returned few results, falling back to web search', {
+        city,
+        redfinCount: redfinListings.length,
+      });
 
-    const raw = await extractListings(client, city, text);
-    logger.info('Listings extracted', { city, count: raw.listings.length });
+      const { text, toolCallCount } = await runAgentLoop(client, {
+        model: MODELS.SUB_AGENT,
+        systemPrompt: PROPERTY_SCOUT_SYSTEM_PROMPT,
+        initialMessage: buildCityMessage(city, maxPrice, minPrice, propertyType),
+        tools: [WEB_SEARCH_TOOL],
+        agentLabel: `scout-${city.replace(/\s+/g, '-').toLowerCase()}`,
+        maxIterations: 20,
+      });
+
+      logger.info('Web search scout complete', { city, toolCallCount });
+      raw = await extractListings(client, city, text);
+    }
+
+    logger.info('Listings acquired', { city, count: raw.listings.length });
 
     const { listings, promising } = screenAndEnrichListings(raw);
 
