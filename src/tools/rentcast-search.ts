@@ -34,7 +34,7 @@ export interface MarketRents {
   rent2br: number;
   rent3br: number;
   rent4br: number;
-  source: 'rentcast-market';
+  source: 'rentcast-market' | 'rental-comps' | 'fallback';
 }
 
 // ── Shared fetch ──────────────────────────────────────────────────────────────
@@ -220,7 +220,7 @@ const NATIONAL_FALLBACK: MarketRents = {
   rent2br: 1200,
   rent3br: 1450,
   rent4br: 1700,
-  source: 'rentcast-market',
+  source: 'fallback',
 };
 
 export async function getMarketRents(

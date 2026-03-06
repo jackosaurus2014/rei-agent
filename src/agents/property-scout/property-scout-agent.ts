@@ -8,7 +8,8 @@ import { logger } from '../../lib/logger';
 import { writePropertyScout } from '../../lib/output-writer';
 import { computeUnderwriting } from '../../lib/underwriting-calculator';
 import { PROPERTY_SCOUT_SYSTEM_PROMPT } from '../../prompts/property-scout-system';
-import { WEB_SEARCH_TOOL, webSearch } from '../../tools/web-search';
+import { WEB_SEARCH_TOOL } from '../../tools/web-search';
+import { estimateMarketRents } from '../../tools/rental-comps';
 import { searchRedfinListings, type RedfinListing } from '../../tools/redfin-search';
 import {
   searchActiveListings,
@@ -87,7 +88,7 @@ type RentLookup = MarketRents;
 
 const FALLBACK_RENTS: RentLookup = {
   rent1br: 850, rent2br: 1050, rent3br: 1250, rent4br: 1450,
-  source: 'rentcast-market',
+  source: 'fallback',
 };
 
 function getRentForBeds(beds: number, lookup: RentLookup): number {
@@ -95,72 +96,6 @@ function getRentForBeds(beds: number, lookup: RentLookup): number {
   if (beds === 2) return lookup.rent2br;
   if (beds === 3) return lookup.rent3br;
   return lookup.rent4br;
-}
-
-// ── Rent lookup tool (used only on web-search fallback path) ─────────────────
-
-const RENT_LOOKUP_TOOL: Anthropic.Tool = {
-  name: 'submit_rent_lookup',
-  description:
-    'Submit estimated monthly market rents by bedroom count for this city, based on your research.',
-  input_schema: {
-    type: 'object',
-    properties: {
-      rent1br: { type: 'number', description: 'Estimated monthly rent for 1-bedroom unit.' },
-      rent2br: { type: 'number', description: 'Estimated monthly rent for 2-bedroom unit.' },
-      rent3br: { type: 'number', description: 'Estimated monthly rent for 3-bedroom unit.' },
-      rent4br: { type: 'number', description: 'Estimated monthly rent for 4-bedroom unit.' },
-      source:  { type: 'string', description: 'Data source (e.g., Zillow, Rentometer, RentCast).' },
-    },
-    required: ['rent1br', 'rent2br', 'rent3br', 'rent4br', 'source'],
-  },
-};
-
-async function estimateCityRentsViaWebSearch(
-  client: Anthropic,
-  city: string
-): Promise<RentLookup> {
-  try {
-    const results = await webSearch(`${city} average monthly rent 2025 by bedroom 1BR 2BR 3BR`, 3);
-    const searchText = results.map(r => `${r.title}\n${r.snippet}\n${r.content}`).join('\n\n---\n\n');
-
-    const response = await withRetry(
-      () =>
-        client.messages.create({
-          model: MODELS.SUB_AGENT,
-          max_tokens: 1024,
-          system:
-            `You are extracting rental rate data for ${city}. ` +
-            'Call submit_rent_lookup with the best estimate for each bedroom count. ' +
-            'If a specific value is not found, estimate based on nearby values.',
-          tools: [RENT_LOOKUP_TOOL],
-          tool_choice: { type: 'tool', name: 'submit_rent_lookup' },
-          messages: [{ role: 'user', content: `Rental market research for ${city}:\n\n${searchText}` }],
-        }),
-      { label: `rent-lookup-${city}` }
-    );
-
-    const toolBlock = response.content.find(
-      (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use'
-    );
-
-    if (toolBlock) {
-      const raw = toolBlock.input as Omit<RentLookup, 'source'> & { source?: string };
-      logger.info('Rent lookup extracted via web search', { city, rent3br: raw.rent3br });
-      return {
-        rent1br: raw.rent1br ?? FALLBACK_RENTS.rent1br,
-        rent2br: raw.rent2br ?? FALLBACK_RENTS.rent2br,
-        rent3br: raw.rent3br ?? FALLBACK_RENTS.rent3br,
-        rent4br: raw.rent4br ?? FALLBACK_RENTS.rent4br,
-        source: 'rentcast-market',
-      };
-    }
-  } catch (err) {
-    logger.warn('Web-search rent estimation failed, using fallback rents', {
-      city, error: err instanceof Error ? err.message : String(err),
-    });
-  }
-  return FALLBACK_RENTS;
 }
 
 // ── Source-tagged listing helpers ─────────────────────────────────────────────
@@ -667,7 +602,7 @@ export async function runPropertyScout(options: PropertyScoutOptions): Promise<v
         const rentLookup = isRentCastAvailable() && stateAbbr
           ? await getMarketRents(cityName, stateAbbr).catch(() => null)
           : null;
-        const rents = rentLookup ?? await estimateCityRentsViaWebSearch(client, city);
+        const rents = rentLookup ?? await estimateMarketRents(cityName, stateAbbr || '').catch(() => FALLBACK_RENTS);
         raw = redfinToRaw(redfinListings, rents, city);
       } else {
         // ── Tier 3: Web search (off-market/auction only) ──────────────────────
