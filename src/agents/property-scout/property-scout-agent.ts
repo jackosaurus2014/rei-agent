@@ -10,6 +10,13 @@ import { computeUnderwriting } from '../../lib/underwriting-calculator';
 import { PROPERTY_SCOUT_SYSTEM_PROMPT } from '../../prompts/property-scout-system';
 import { WEB_SEARCH_TOOL, webSearch } from '../../tools/web-search';
 import { searchRedfinListings, type RedfinListing } from '../../tools/redfin-search';
+import {
+  searchActiveListings,
+  getMarketRents,
+  isRentCastAvailable,
+  type RentCastListing,
+  type MarketRents,
+} from '../../tools/rentcast-search';
 import type { PropertyListing } from '../../types';
 
 // ── Options ───────────────────────────────────────────────────────────────────
@@ -73,7 +80,24 @@ const PROPERTY_LISTINGS_TOOL: Anthropic.Tool = {
   },
 };
 
-// ── Rent lookup tool (used with Redfin path) ──────────────────────────────────
+// ── Rent lookup (shared by RentCast and Redfin paths) ────────────────────────
+
+// Re-export MarketRents type alias for internal use
+type RentLookup = MarketRents;
+
+const FALLBACK_RENTS: RentLookup = {
+  rent1br: 850, rent2br: 1050, rent3br: 1250, rent4br: 1450,
+  source: 'rentcast-market',
+};
+
+function getRentForBeds(beds: number, lookup: RentLookup): number {
+  if (beds <= 1) return lookup.rent1br;
+  if (beds === 2) return lookup.rent2br;
+  if (beds === 3) return lookup.rent3br;
+  return lookup.rent4br;
+}
+
+// ── Rent lookup tool (used only on web-search fallback path) ─────────────────
 
 const RENT_LOOKUP_TOOL: Anthropic.Tool = {
   name: 'submit_rent_lookup',
@@ -92,29 +116,11 @@ const RENT_LOOKUP_TOOL: Anthropic.Tool = {
   },
 };
 
-interface RentLookup {
-  rent1br: number;
-  rent2br: number;
-  rent3br: number;
-  rent4br: number;
-}
-
-// Fallback rents used when research fails (conservative national averages for smaller metros)
-const FALLBACK_RENTS: RentLookup = { rent1br: 850, rent2br: 1050, rent3br: 1250, rent4br: 1450 };
-
-function getRentForBeds(beds: number, lookup: RentLookup): number {
-  if (beds <= 1) return lookup.rent1br;
-  if (beds === 2) return lookup.rent2br;
-  if (beds === 3) return lookup.rent3br;
-  return lookup.rent4br; // 4+ bed
-}
-
-async function estimateCityRents(
+async function estimateCityRentsViaWebSearch(
   client: Anthropic,
   city: string
 ): Promise<RentLookup> {
   try {
-    // One search for rent data
     const results = await webSearch(`${city} average monthly rent 2025 by bedroom 1BR 2BR 3BR`, 3);
     const searchText = results.map(r => `${r.title}\n${r.snippet}\n${r.content}`).join('\n\n---\n\n');
 
@@ -125,8 +131,8 @@ async function estimateCityRents(
           max_tokens: 1024,
           system:
             `You are extracting rental rate data for ${city}. ` +
-            'Call submit_rent_lookup with the best estimate for each bedroom count based on the research. ' +
-            'If a specific value is not found, estimate based on nearby values (e.g., 4BR ≈ 3BR + 15%).',
+            'Call submit_rent_lookup with the best estimate for each bedroom count. ' +
+            'If a specific value is not found, estimate based on nearby values.',
           tools: [RENT_LOOKUP_TOOL],
           tool_choice: { type: 'tool', name: 'submit_rent_lookup' },
           messages: [{ role: 'user', content: `Rental market research for ${city}:\n\n${searchText}` }],
@@ -139,37 +145,53 @@ async function estimateCityRents(
     );
 
     if (toolBlock) {
-      const raw = toolBlock.input as RentLookup & { source?: string };
-      logger.info('Rent lookup extracted', { city, rent3br: raw.rent3br, source: raw.source });
+      const raw = toolBlock.input as Omit<RentLookup, 'source'> & { source?: string };
+      logger.info('Rent lookup extracted via web search', { city, rent3br: raw.rent3br });
       return {
         rent1br: raw.rent1br ?? FALLBACK_RENTS.rent1br,
         rent2br: raw.rent2br ?? FALLBACK_RENTS.rent2br,
         rent3br: raw.rent3br ?? FALLBACK_RENTS.rent3br,
         rent4br: raw.rent4br ?? FALLBACK_RENTS.rent4br,
+        source: 'rentcast-market',
       };
     }
   } catch (err) {
-    logger.warn('Rent estimation failed, using fallback rents', {
-      city,
-      error: err instanceof Error ? err.message : String(err),
+    logger.warn('Web-search rent estimation failed, using fallback rents', {
+      city, error: err instanceof Error ? err.message : String(err),
     });
   }
-
   return FALLBACK_RENTS;
 }
 
-// ── Convert Redfin listing to RawListingResult format ─────────────────────────
+// ── Source-tagged listing helpers ─────────────────────────────────────────────
 
-function redfinToRaw(
-  listings: RedfinListing[],
+type ListingSource = 'redfin' | 'web' | 'auction' | 'wholesale' | 'zillow' | 'realtor';
+
+function sourceTag(source: ListingSource): string {
+  if (source === 'redfin') return '[Redfin active]';
+  if (source === 'auction') return '[Auction — verify]';
+  if (source === 'wholesale') return '[Off-market — verify]';
+  return '[Web search — verify before proceeding]';
+}
+
+// ── Convert RentCast listings → RawListingResult ──────────────────────────────
+
+function rentcastToRaw(
+  listings: RentCastListing[],
   rentLookup: RentLookup,
   city: string
 ): RawListingResult {
+  const prices = listings.map(l => l.price);
+  const minP = prices.length ? Math.min(...prices).toLocaleString() : '?';
+  const maxP = prices.length ? Math.max(...prices).toLocaleString() : '?';
+
   return {
     listings: listings.map(r => {
       const rent = getRentForBeds(r.beds, rentLookup);
       const typeLabel = r.propertyType.includes('Multi') ? 'Multifamily' : 'Single family';
-      const dom = r.daysOnMarket > 0 ? `${r.daysOnMarket} days on market.` : 'Days on market unknown.';
+      const dom = r.daysOnMarket > 0 ? `${r.daysOnMarket} days on market.` : '';
+      const yr = r.yearBuilt > 0 ? ` Built ${r.yearBuilt}.` : '';
+      const mls = r.mlsNumber ? ` MLS# ${r.mlsNumber} (${r.mlsName}).` : '';
       return {
         address: r.address,
         city: r.city,
@@ -180,16 +202,56 @@ function redfinToRaw(
         baths: r.baths,
         sqft: r.sqft,
         estimatedMonthlyRent: rent,
-        source: 'redfin',
+        source: 'redfin' as ListingSource,   // RentCast pulls from MLS (same feeds as Redfin)
         url: r.url,
-        notes: `${typeLabel}. ${dom} Rent estimated from ${city} market data.`,
+        notes: `[MLS] ${typeLabel}.${yr}${dom ? ` ${dom}` : ''}${mls} Rent from RentCast market data.`,
+      };
+    }),
+    marketContext:
+      `Found ${listings.length} active MLS listings (via RentCast) in ${city} ` +
+      `priced $${minP}–$${maxP}. ` +
+      `Market rents: 1BR ~$${rentLookup.rent1br.toLocaleString()}, ` +
+      `2BR ~$${rentLookup.rent2br.toLocaleString()}, ` +
+      `3BR ~$${rentLookup.rent3br.toLocaleString()}/mo.`,
+    searchesPerformed: 2,
+  };
+}
+
+// ── Convert Redfin listings → RawListingResult ────────────────────────────────
+
+function redfinToRaw(
+  listings: RedfinListing[],
+  rentLookup: RentLookup,
+  city: string
+): RawListingResult {
+  const prices = listings.map(l => l.price);
+  const minP = prices.length ? Math.min(...prices).toLocaleString() : '?';
+  const maxP = prices.length ? Math.max(...prices).toLocaleString() : '?';
+
+  return {
+    listings: listings.map(r => {
+      const rent = getRentForBeds(r.beds, rentLookup);
+      const typeLabel = r.propertyType.includes('Multi') ? 'Multifamily' : 'Single family';
+      const dom = r.daysOnMarket > 0 ? `${r.daysOnMarket} days on market.` : '';
+      return {
+        address: r.address,
+        city: r.city,
+        state: r.state,
+        zipCode: r.zipCode,
+        price: r.price,
+        beds: r.beds,
+        baths: r.baths,
+        sqft: r.sqft,
+        estimatedMonthlyRent: rent,
+        source: 'redfin' as ListingSource,
+        url: r.url,
+        notes: `[Redfin active] ${typeLabel}.${dom ? ` ${dom}` : ''} Rent estimated from market data.`,
       };
     }),
     marketContext:
       `Found ${listings.length} active Redfin listings in ${city} ` +
-      `priced between $${listings.length > 0 ? Math.min(...listings.map(l => l.price)).toLocaleString() : '?'} ` +
-      `and $${listings.length > 0 ? Math.max(...listings.map(l => l.price)).toLocaleString() : '?'}. ` +
-      `Rents estimated from local market data (3BR ~$${rentLookup.rent3br.toLocaleString()}/mo).`,
+      `priced $${minP}–$${maxP}. ` +
+      `3BR rent ~$${rentLookup.rent3br.toLocaleString()}/mo.`,
     searchesPerformed: 2,
   };
 }
@@ -339,24 +401,33 @@ function buildCityMarkdown(
 ): string {
   const today = new Date().toISOString().split('T')[0];
 
-  const tableRows = listings.map(l =>
-    `| ${l.address} | $${l.price.toLocaleString()} | ${l.beds}BR/${l.baths}BA | $${l.estimatedMonthlyRent.toLocaleString()}/mo | ${l.estimatedCapRate > 0 ? `${l.estimatedCapRate}%` : 'N/A'} | ${l.estimatedGRM > 0 ? `${l.estimatedGRM}x` : 'N/A'} | ${l.source} |`
-  ).join('\n');
+  const tableRows = listings.map(l => {
+    const tag = l.notes.startsWith('[MLS]') ? '✅ MLS'
+      : l.notes.startsWith('[Redfin active]') ? '✅ Redfin'
+      : l.notes.startsWith('[Auction') ? '⚠️ Auction'
+      : '⚠️ Web';
+    return `| ${l.address} | $${l.price.toLocaleString()} | ${l.beds}BR/${l.baths}BA | $${l.estimatedMonthlyRent.toLocaleString()}/mo | ${l.estimatedCapRate > 0 ? `${l.estimatedCapRate}%` : 'N/A'} | ${l.estimatedGRM > 0 ? `${l.estimatedGRM}x` : 'N/A'} | ${tag} |`;
+  }).join('\n');
 
   const promisingSection = promising.length > 0
     ? `## Pre-Screened Opportunities (Est. Cap Rate ≥ ${SCREEN_CAP_RATE_THRESHOLD}%)
 
-${promising.map(l => `### ${l.address}
+${promising.map(l => {
+  const type = l.notes.includes('Multifamily') ? 'multifamily' : 'sfr';
+  const verifyNote = l.notes.includes('[MLS]') || l.notes.includes('[Redfin active]')
+    ? ''
+    : '\n> ⚠️ **Web search source — confirm this listing is active before proceeding.**';
+  return `### ${l.address}
 - **Price**: $${l.price.toLocaleString()}
 - **Beds/Baths**: ${l.beds}BR/${l.baths}BA${l.sqft ? ` · ${l.sqft.toLocaleString()} sqft` : ''}
 - **Est. Monthly Rent**: $${l.estimatedMonthlyRent.toLocaleString()}/mo
 - **Est. Cap Rate**: ${l.estimatedCapRate}%  |  **Est. GRM**: ${l.estimatedGRM}x
-- **Source**: ${l.source}${l.url ? ` · [Listing](${l.url})` : ''}
+- **Source**: ${l.notes.split('.')[0]}${l.url ? ` · [View Listing](${l.url})` : ''}
 - **Notes**: ${l.notes}
-
+${verifyNote}
 *To run full deal analysis:*
-\`npx tsx src/index.ts analyze --address "${l.address}" --price ${l.price} --type sfr\`
-`).join('\n---\n\n')}`
+\`npx tsx src/index.ts analyze --address "${l.address}" --price ${l.price} --type ${type}\``;
+}).join('\n\n---\n\n')}`
     : `## Pre-Screened Opportunities\n\nNo listings met the ${SCREEN_CAP_RATE_THRESHOLD}% estimated cap rate threshold. Review all listings above and verify rent assumptions manually.`;
 
   return `# Investment Properties: ${city} — ${today}
@@ -369,8 +440,10 @@ ${context}
 
 ## All Listings Found (${listings.length} total)
 
-| Address | Price | Beds | Est. Rent | Est. Cap Rate | GRM | Source |
-|---------|-------|------|-----------|---------------|-----|--------|
+> **Data key**: ✅ MLS = active MLS listing (verify before offer) · ⚠️ Web/Auction = web search result (must verify independently)
+
+| Address | Price | Beds | Est. Rent | Est. Cap Rate | GRM | Data Source |
+|---------|-------|------|-----------|---------------|-----|-------------|
 ${tableRows || '| _No listings found_ | — | — | — | — | — | — |'}
 
 ---
@@ -381,15 +454,15 @@ ${promisingSection}
 
 ## Next Steps
 
-1. Run full deal analysis on any promising listing:
+1. Click each **View Listing** link to verify the property is still active and price is correct
+2. Run full deal analysis on confirmed listings:
    \`npx tsx src/index.ts analyze --address "ADDRESS" --price PRICE --type sfr\`
-2. Verify rent assumptions with local property managers or Zillow rent estimates
-3. Confirm listings are still active before making offers
+3. Cross-check rent estimates with local property managers or Zillow rent estimates
 
 ---
 
 *Generated by REI Agent System. Not financial advice. Verify all data independently.*
-*Scout date: ${today}*`;
+*Scout date: ${today} · Listings filtered to ≤270 days on market*`;
 }
 
 // ── Auto-load cities from latest market research ──────────────────────────────
@@ -556,42 +629,70 @@ export async function runPropertyScout(options: PropertyScoutOptions): Promise<v
   for (const city of cities) {
     logger.info('Scouting city', { city });
 
-    // ── Primary path: Redfin API ─────────────────────────────────────────────
+    // ── Three-tier listing priority ───────────────────────────────────────────
+    // Tier 1: RentCast API   → real MLS data, nationwide, accurate prices
+    // Tier 2: Redfin GIS-CSV → major cities, free, active-only
+    // Tier 3: Web search     → off-market/auction leads only (stale — tag accordingly)
+
     let raw: RawListingResult;
+    const [cityName, stateAbbr] = city.includes(',')
+      ? city.split(',').map(s => s.trim())
+      : [city, ''];
 
-    const redfinListings = await searchRedfinListings(city, minPrice, maxPrice).catch(err => {
-      logger.warn('Redfin search failed, will use web search fallback', {
-        city,
-        error: err instanceof Error ? err.message : String(err),
+    // ── Tier 1: RentCast ────────────────────────────────────────────────────
+    let usedTier = 1;
+    let rentcastListings: RentCastListing[] = [];
+
+    if (isRentCastAvailable() && stateAbbr) {
+      rentcastListings = await searchActiveListings(cityName, stateAbbr, minPrice, maxPrice).catch(err => {
+        logger.warn('RentCast search failed', { city, error: err instanceof Error ? err.message : String(err) });
+        return [] as RentCastListing[];
       });
-      return [] as RedfinListing[];
-    });
-
-    if (redfinListings.length >= 3) {
-      logger.info('Using Redfin listings', { city, count: redfinListings.length });
-      const rentLookup = await estimateCityRents(client, city);
-      raw = redfinToRaw(redfinListings, rentLookup, city);
-    } else {
-      // ── Fallback: web search agent loop ─────────────────────────────────────
-      logger.info('Redfin returned few results, falling back to web search', {
-        city,
-        redfinCount: redfinListings.length,
-      });
-
-      const { text, toolCallCount } = await runAgentLoop(client, {
-        model: MODELS.SUB_AGENT,
-        systemPrompt: PROPERTY_SCOUT_SYSTEM_PROMPT,
-        initialMessage: buildCityMessage(city, maxPrice, minPrice, propertyType),
-        tools: [WEB_SEARCH_TOOL],
-        agentLabel: `scout-${city.replace(/\s+/g, '-').toLowerCase()}`,
-        maxIterations: 20,
-      });
-
-      logger.info('Web search scout complete', { city, toolCallCount });
-      raw = await extractListings(client, city, text);
     }
 
-    logger.info('Listings acquired', { city, count: raw.listings.length });
+    if (rentcastListings.length >= 3) {
+      logger.info('Tier 1: Using RentCast MLS listings', { city, count: rentcastListings.length });
+      const rentLookup = await getMarketRents(cityName, stateAbbr).catch(() => FALLBACK_RENTS);
+      raw = rentcastToRaw(rentcastListings, rentLookup, city);
+    } else {
+      // ── Tier 2: Redfin GIS-CSV ─────────────────────────────────────────────
+      usedTier = 2;
+      const redfinListings = await searchRedfinListings(city, minPrice, maxPrice).catch(err => {
+        logger.warn('Redfin search failed', { city, error: err instanceof Error ? err.message : String(err) });
+        return [] as RedfinListing[];
+      });
+
+      if (redfinListings.length >= 3) {
+        logger.info('Tier 2: Using Redfin active listings', { city, count: redfinListings.length });
+        const rentLookup = isRentCastAvailable() && stateAbbr
+          ? await getMarketRents(cityName, stateAbbr).catch(() => null)
+          : null;
+        const rents = rentLookup ?? await estimateCityRentsViaWebSearch(client, city);
+        raw = redfinToRaw(redfinListings, rents, city);
+      } else {
+        // ── Tier 3: Web search (off-market/auction only) ──────────────────────
+        usedTier = 3;
+        logger.info('Tier 3: Falling back to web search (MLS APIs had no results)', {
+          city,
+          rentcastCount: rentcastListings.length,
+          redfinCount: redfinListings.length,
+        });
+
+        const { text, toolCallCount } = await runAgentLoop(client, {
+          model: MODELS.SUB_AGENT,
+          systemPrompt: PROPERTY_SCOUT_SYSTEM_PROMPT,
+          initialMessage: buildCityMessage(city, maxPrice, minPrice, propertyType),
+          tools: [WEB_SEARCH_TOOL],
+          agentLabel: `scout-${city.replace(/[\s,]+/g, '-').toLowerCase()}`,
+          maxIterations: 20,
+        });
+
+        logger.info('Web search scout complete', { city, toolCallCount });
+        raw = await extractListings(client, city, text);
+      }
+    }
+
+    logger.info('Listings acquired', { city, tier: usedTier, count: raw.listings.length });
 
     const { listings, promising } = screenAndEnrichListings(raw);
 
